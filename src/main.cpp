@@ -1,364 +1,252 @@
-
+#include <Arduino.h>
 #include <Wire.h>
-#include <SPI.h>
+#include <WiFi.h>
+#include "credentials.h"
+
+#if ESP_IDF_VERSION_MAJOR >= 5
+	#include <esp_eap_client.h>
+#else
+	#include "esp_wpa2.h" //Nur bei Schulnetz notwendig
+#endif
+
+#include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
 #include <Adafruit_PN532.h>
+#include <Adafruit_NeoPixel.h>
+#include <LittleFS.h>
 
 
-// If using the breakout or shield with I2C, define just the pins connected
-// to the IRQ and reset lines.  Use the values below (2, 3) for the shield!
-#define PN532_IRQ   (2)
-#define PN532_RESET (3)  // Not connected by default on the NFC Shield
 
-const int DELAY_BETWEEN_CARDS = 500;
-long timeLastCardRead = 0;
-boolean readerDisabled = false;
-int irqCurr;
-int irqPrev;
+// PN532 over I2C with IRQ/RESET lines
+constexpr uint8_t PN532_IRQ_PIN = 2;
+constexpr uint8_t PN532_RESET_PIN = 3;
+constexpr uint8_t I2C_SDA_PIN = 8;
+constexpr uint8_t I2C_SCL_PIN = 9;
+constexpr uint8_t STATUS_LED_PIN = 48;
+constexpr uint8_t STATUS_LED_COUNT = 1;
 
-volatile boolean cardDetected = false;
-bool irqDetectionArmed = false;
-bool irqDetectionWarned = false;
-
+// NTAG215 layout
 constexpr uint8_t NTAG215_FIRST_USER_PAGE = 4;
 constexpr uint8_t NTAG215_LAST_USER_PAGE = 129;
-constexpr uint8_t NTAG215_CFG1_PAGE = 131;       // AUTH0 in byte 3
-constexpr uint8_t NTAG215_ACCESS_PAGE = 132;     // ACCESS in byte 0, PROT bit is bit 7
+constexpr uint8_t NTAG215_CFG1_PAGE = 131;    // AUTH0 in byte 3
+constexpr uint8_t NTAG215_ACCESS_PAGE = 132;  // PROT bit in byte 0 bit 7
 constexpr uint8_t NTAG215_PWD_PAGE = 133;
 constexpr uint8_t NTAG215_PACK_PAGE = 134;
 
-enum PendingAction {
-  ACTION_NONE,
-  ACTION_ERASE,
-  ACTION_WRITE,
-  ACTION_SET_PASSWORD,
-  ACTION_REMOVE_PASSWORD
+constexpr uint16_t TAG_WAIT_TIMEOUT_MS = 3500;
+constexpr uint8_t UID_READ_ATTEMPTS = 4;
+constexpr uint8_t PAGE_READ_ATTEMPTS = 4;
+constexpr uint8_t PAGE_WRITE_ATTEMPTS = 3;
+
+
+Adafruit_PN532 nfc(PN532_IRQ_PIN, PN532_RESET_PIN);
+AsyncWebServer server(80);
+Adafruit_NeoPixel statusLed(STATUS_LED_COUNT, STATUS_LED_PIN, NEO_GRB + NEO_KHZ800);
+uint32_t apiRequestCounter = 0;
+
+void logLine(const String &msg) {
+  Serial.print("[");
+  Serial.print(millis());
+  Serial.print(" ms] ");
+  Serial.println(msg);
+}
+
+void logRequest(uint32_t reqId, const String &msg) {
+  Serial.print("[");
+  Serial.print(millis());
+  Serial.print(" ms][REQ ");
+  Serial.print(reqId);
+  Serial.print("] ");
+  Serial.println(msg);
+}
+
+enum LedState {
+  LED_BOOT,
+  LED_WIFI_READY,
+  LED_IDLE,
+  LED_BUSY,
+  LED_OK,
+  LED_ERROR
 };
 
-PendingAction pendingAction = ACTION_NONE;
-String pendingWriteText;
-uint8_t pendingPassword[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
-uint8_t pendingPack[2] = { 0x00, 0x00 };
+void setStatusLed(LedState state) {
+  uint8_t r = 0;
+  uint8_t g = 0;
+  uint8_t b = 0;
 
-uint8_t currentPassword[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
+  switch (state) {
+    case LED_BOOT:
+      r = 40; g = 0; b = 40;   // purple
+      break;
+    case LED_WIFI_READY:
+      r = 0; g = 35; b = 35;   // cyan
+      break;
+    case LED_IDLE:
+      r = 0; g = 15; b = 0;    // dim green
+      break;
+    case LED_BUSY:
+      r = 40; g = 20; b = 0;   // yellow/orange
+      break;
+    case LED_OK:
+      r = 0; g = 60; b = 0;    // green
+      break;
+    case LED_ERROR:
+      r = 60; g = 0; b = 0;    // red
+      break;
+  }
 
-
-// This example uses the IRQ line, which is available when in I2C mode.
-Adafruit_PN532 nfc(PN532_IRQ, PN532_RESET);
-
-//Adafruit_PN532 nfc(0x24);     // pn532 i2c adresse
-
-
-void startListeningToNFC();
-void handleCardDetected();
-void processSerialCommands();
-void printHelp();
-void dumpTagPages(uint8_t firstPage, uint8_t lastPage);
-bool eraseTagUserMemory();
-bool writeStringToTag(const String& text);
-bool setTagPassword(const uint8_t pwd[4], const uint8_t pack[2], uint8_t auth0);
-bool removeTagPassword();
-bool authenticateTag(const uint8_t pwd[4], uint8_t packOut[2]);
-bool parseHexBytes(const String& hex, uint8_t* out, size_t outLen);
-void printActionPrompt();
-
-void IRAM_ATTR isrNFCCardDetected() {
-  cardDetected = true;
+  statusLed.setPixelColor(0, statusLed.Color(r, g, b));
+  statusLed.show();
 }
 
-void setup(void) {
-  Serial.begin(115200);
-  Serial.println("Hello from NFC reader!");
-  pinMode(PN532_IRQ, INPUT_PULLUP);
-
-  attachInterrupt(digitalPinToInterrupt(PN532_IRQ), isrNFCCardDetected, FALLING);
-  Wire.begin(8, 9); // SDA, SCL
-  nfc.begin();
-
-  uint32_t versiondata = nfc.getFirmwareVersion();
-  if (! versiondata) {
-    Serial.print("Didn't find PN53x board");
-    while (1); // halt
-  }
-  // Got ok data, print it out!
-  Serial.print("Found chip PN5"); Serial.println((versiondata>>24) & 0xFF, HEX);
-  Serial.print("Firmware ver. "); Serial.print((versiondata>>16) & 0xFF, DEC);
-  Serial.print('.'); Serial.println((versiondata>>8) & 0xFF, DEC);
-
-  if (!nfc.SAMConfig()) {
-    Serial.println("SAMConfig failed");
-    while (1);
-  }
-
-  startListeningToNFC();
-  printHelp();
+String jsonError(const String &msg) {
+  JsonDocument doc;
+  doc["ok"] = false;
+  doc["error"] = msg;
+  String out;
+  serializeJson(doc, out);
+  return out;
 }
 
-void loop(void) {
-  processSerialCommands();
-
-    
-  if (cardDetected && !readerDisabled) {
-    cardDetected = false;
-    handleCardDetected();
-    }
-  // Fallback polling: some PN532 + ESP32-S3 setups don't deliver reliable IRQ.
-  if (!readerDisabled && !irqDetectionArmed) {
-    handleCardDetected();
+String uidToHex(const uint8_t *uid, uint8_t uidLength) {
+  static const char *hex = "0123456789ABCDEF";
+  String out;
+  out.reserve(uidLength * 2);
+  for (uint8_t i = 0; i < uidLength; i++) {
+    out += hex[(uid[i] >> 4) & 0x0F];
+    out += hex[uid[i] & 0x0F];
   }
-  if (readerDisabled && (millis() - timeLastCardRead > DELAY_BETWEEN_CARDS)) {
-    readerDisabled = false;
-    startListeningToNFC();
-    // Serial.println("Reader enabled again, waiting for a card...");
-  }
+  return out;
 }
 
-void handleCardDetected() {
-    bool success = false;
-    uint8_t uid[] = { 0, 0, 0, 0, 0, 0, 0 };  // Buffer to store the returned UID
-    uint8_t uidLength;                        // Length of the UID (4 or 7 bytes depending on ISO14443A card type)
+String currentIp() {
+  IPAddress ip = WiFi.localIP();
+  if (ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0) {
+    ip = WiFi.softAPIP();
+  }
+  return ip.toString();
+}
 
-    // Prefer IRQ response if armed, otherwise (or on failure) use short polling read.
-    if (irqDetectionArmed) {
-    success = nfc.readDetectedPassiveTargetID(uid, &uidLength);
-    }
-    if (!success) {
-      success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 30);
-    }
+String detectTagType(uint8_t uidLength) {
+  if (uidLength == 7) {
+    return "NTAG2xx/Ultralight-compatible";
+  }
+  if (uidLength == 4) {
+    return "MIFARE Classic compatible";
+  }
+  return "ISO14443A";
+}
 
-    if (success) {
-      Serial.println("Read successful");
-      // Display some basic information about the card
-      Serial.println("Found an ISO14443A card");
-      Serial.print("  UID Length: ");Serial.print(uidLength, DEC);Serial.println(" bytes");
-      Serial.print("  UID Value: ");
-      nfc.PrintHex(uid, uidLength);
+bool readTagUid(uint8_t *uid, uint8_t *uidLength, uint16_t timeoutMs = TAG_WAIT_TIMEOUT_MS) {
+  const uint32_t deadline = millis() + timeoutMs;
+  uint8_t localUid[7] = {0};
+  uint8_t localUidLen = 0;
+  uint16_t totalAttempts = 0;
 
-      if (uidLength == 4)
-      {
-        // We probably have a Mifare Classic card ...
-        uint32_t cardid = uid[0];
-        cardid <<= 8;
-        cardid |= uid[1];
-        cardid <<= 8;
-        cardid |= uid[2];
-        cardid <<= 8;
-        cardid |= uid[3];
-        Serial.print("Seems to be a Mifare Classic card #");
-        Serial.println(cardid);
+  while (millis() < deadline) {
+    for (uint8_t attempt = 0; attempt < UID_READ_ATTEMPTS; attempt++) {
+      totalAttempts++;
+      if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, localUid, &localUidLen, 120)) {
+        memcpy(uid, localUid, localUidLen);
+        *uidLength = localUidLen;
+        logLine("UID read OK after " + String(totalAttempts) + " attempts, uidLen=" + String(localUidLen));
+        return true;
       }
-      Serial.println("");
+      logLine("UID read attempt failed: " + String(totalAttempts));
+      delay(20);
+    }
+    delay(40);
+  }
+  logLine("UID read timeout after attempts=" + String(totalAttempts));
+  return false;
+}
 
-      bool opSuccess = true;
-      switch (pendingAction) {
-        case ACTION_ERASE:
-          Serial.println("Running erase...");
-          opSuccess = eraseTagUserMemory();
-          Serial.println(opSuccess ? "Erase finished." : "Erase failed.");
-          pendingAction = ACTION_NONE;
-          break;
-        case ACTION_WRITE:
-          Serial.println("Running write...");
-          opSuccess = writeStringToTag(pendingWriteText);
-          Serial.println(opSuccess ? "Write finished." : "Write failed.");
-          pendingAction = ACTION_NONE;
-          break;
-        case ACTION_SET_PASSWORD:
-          Serial.println("Running setPassword...");
-          opSuccess = setTagPassword(pendingPassword, pendingPack, NTAG215_FIRST_USER_PAGE);
-          if (opSuccess) {
-            memcpy(currentPassword, pendingPassword, sizeof(currentPassword));
-          }
-          Serial.println(opSuccess ? "Password set." : "setPassword failed.");
-          pendingAction = ACTION_NONE;
-          break;
-        case ACTION_REMOVE_PASSWORD:
-          Serial.println("Running removePassword...");
-          opSuccess = removeTagPassword();
-          Serial.println(opSuccess ? "Password removed." : "removePassword failed.");
-          pendingAction = ACTION_NONE;
-          break;
-        case ACTION_NONE:
-        default:
-          dumpTagPages(NTAG215_FIRST_USER_PAGE, NTAG215_LAST_USER_PAGE);
-          break;
+bool readPageWithRetry(uint8_t page, uint8_t *buffer) {
+  for (uint8_t attempt = 0; attempt < PAGE_READ_ATTEMPTS; attempt++) {
+    if (nfc.ntag2xx_ReadPage(page, buffer)) {
+      if (attempt > 0) {
+        logLine("Page " + String(page) + " read recovered on retry " + String(attempt + 1));
       }
-
-      timeLastCardRead = millis();
+      return true;
     }
-
-    // The reader will be enabled again after DELAY_BETWEEN_CARDS ms will pass.
-    readerDisabled = true;
+    logLine("Page read failed: page=" + String(page) + " attempt=" + String(attempt + 1));
+    delay(8);
+  }
+  logLine("Page read failed permanently: page=" + String(page));
+  return false;
 }
 
-void startListeningToNFC() {
-  irqDetectionArmed = nfc.startPassiveTargetIDDetection(PN532_MIFARE_ISO14443A);
-  if (!irqDetectionArmed && !irqDetectionWarned) {
-    Serial.println("IRQ detection could not be armed, using polling fallback.");
-    irqDetectionWarned = true;
-  }
-}
-
-void processSerialCommands() {
-  if (!Serial.available()) {
-    return;
-  }
-
-  String line = Serial.readStringUntil('\n');
-  line.trim();
-  if (line.length() == 0) {
-    return;
-  }
-
-  String cmd = line;
-  cmd.toLowerCase();
-
-  if (cmd == "help") {
-    printHelp();
-    return;
-  }
-
-  if (cmd == "dump") {
-    pendingAction = ACTION_NONE;
-    printActionPrompt();
-    return;
-  }
-
-  if (cmd == "erase") {
-    pendingAction = ACTION_ERASE;
-    printActionPrompt();
-    return;
-  }
-
-  if (cmd.startsWith("write ")) {
-    pendingWriteText = line.substring(6);
-    if (pendingWriteText.length() == 0) {
-      Serial.println("write braucht einen String.");
-      return;
-    }
-    pendingAction = ACTION_WRITE;
-    printActionPrompt();
-    return;
-  }
-
-  if (cmd.startsWith("setpassword ")) {
-    String rest = line.substring(12);
-    rest.trim();
-    int sep = rest.indexOf(' ');
-
-    String pwdHex = rest;
-    String packHex = "0000";
-    if (sep >= 0) {
-      pwdHex = rest.substring(0, sep);
-      packHex = rest.substring(sep + 1);
-      packHex.trim();
-    }
-
-    if (!parseHexBytes(pwdHex, pendingPassword, sizeof(pendingPassword))) {
-      Serial.println("setpassword: Passwort muss 8 Hex-Zeichen haben (z.B. A1B2C3D4).");
-      return;
-    }
-    if (!parseHexBytes(packHex, pendingPack, sizeof(pendingPack))) {
-      Serial.println("setpassword: PACK muss 4 Hex-Zeichen haben (z.B. 1234).");
-      return;
-    }
-
-    pendingAction = ACTION_SET_PASSWORD;
-    printActionPrompt();
-    return;
-  }
-
-  if (cmd == "removepassword") {
-    pendingAction = ACTION_REMOVE_PASSWORD;
-    printActionPrompt();
-    return;
-  }
-
-  Serial.println("Unbekannter Befehl. 'help' fuer Hilfe.");
-}
-
-void printHelp() {
-  Serial.println("");
-  Serial.println("Befehle:");
-  Serial.println("  dump");
-  Serial.println("  erase");
-  Serial.println("  write <text>");
-  Serial.println("  setpassword <pwdHex8> [packHex4]");
-  Serial.println("  removepassword");
-  Serial.println("Beispiele:");
-  Serial.println("  write Hallo Welt");
-  Serial.println("  setpassword A1B2C3D4 1234");
-  Serial.println("");
-}
-
-void printActionPrompt() {
-  Serial.println("Befehl gespeichert. Tag auflegen.");
-}
-
-void dumpTagPages(uint8_t firstPage, uint8_t lastPage) {
-  uint8_t pageData[4];
-  String text = "";
-  bool endOfText = false;
-
-  Serial.println("Reading tag as string:");
-  for (uint8_t page = firstPage; page <= lastPage; page++) {
-    if (nfc.ntag2xx_ReadPage(page, pageData)) {
-      for (uint8_t i = 0; i < 4; i++) {
-        uint8_t c = pageData[i];
-        if (c == 0x00 || c == 0xFE) {
-          endOfText = true;
-          break;
-        }
-        if ((c >= 32 && c <= 126) || c == '\n' || c == '\r' || c == '\t') {
-          text += static_cast<char>(c);
-        } else {
-          text += '.';
-        }
+bool writePageWithRetry(uint8_t page, uint8_t *buffer) {
+  for (uint8_t attempt = 0; attempt < PAGE_WRITE_ATTEMPTS; attempt++) {
+    if (nfc.ntag2xx_WritePage(page, buffer)) {
+      if (attempt > 0) {
+        logLine("Page " + String(page) + " write recovered on retry " + String(attempt + 1));
       }
-      if (endOfText) {
+      return true;
+    }
+    logLine("Page write failed: page=" + String(page) + " attempt=" + String(attempt + 1));
+    delay(8);
+  }
+  logLine("Page write failed permanently: page=" + String(page));
+  return false;
+}
+
+bool readTagText(String &textOut) {
+  textOut = "";
+  uint8_t pageData[4] = {0};
+  bool reachedEnd = false;
+  uint16_t bytesRead = 0;
+
+  for (uint8_t page = NTAG215_FIRST_USER_PAGE; page <= NTAG215_LAST_USER_PAGE; page++) {
+    if (!readPageWithRetry(page, pageData)) {
+      return false;
+    }
+    for (uint8_t i = 0; i < 4; i++) {
+      const uint8_t c = pageData[i];
+      if (c == 0x00 || c == 0xFE) {
+        reachedEnd = true;
         break;
       }
-    } else {
-      Serial.print("Read failed at page ");
-      Serial.println(page);
+      bytesRead++;
+      if ((c >= 32 && c <= 126) || c == '\n' || c == '\r' || c == '\t') {
+        textOut += static_cast<char>(c);
+      } else {
+        textOut += '.';
+      }
+    }
+    if (reachedEnd) {
       break;
     }
   }
-  if (text.length() == 0) {
-    Serial.println("(leer)");
-  } else {
-    Serial.println(text);
-  }
-  Serial.println("String read finished.");
+  logLine("Tag text read complete, bytes=" + String(bytesRead) + ", textLen=" + String(textOut.length()));
+  return true;
 }
 
 bool eraseTagUserMemory() {
-  uint8_t data[4] = { 0, 0, 0, 0 };
+  uint8_t blank[4] = {0, 0, 0, 0};
   for (uint8_t page = NTAG215_FIRST_USER_PAGE; page <= NTAG215_LAST_USER_PAGE; page++) {
-    if (!nfc.ntag2xx_WritePage(page, data)) {
-      Serial.print("Erase failed at page ");
-      Serial.println(page);
+    if (!writePageWithRetry(page, blank)) {
       return false;
     }
   }
   return true;
 }
 
-bool writeStringToTag(const String& text) {
-  const size_t maxUserBytes = (NTAG215_LAST_USER_PAGE - NTAG215_FIRST_USER_PAGE + 1) * 4;
-  const size_t payloadBytes = text.length() + 1;  // Include terminating 0x00.
+bool writeStringToTag(const String &text) {
+  const size_t maxUserBytes =
+      (NTAG215_LAST_USER_PAGE - NTAG215_FIRST_USER_PAGE + 1) * 4;
+  const size_t payloadBytes = text.length() + 1;  // Include trailing 0x00.
+
   if (payloadBytes > maxUserBytes) {
-    Serial.print("String zu lang. Max Bytes inkl. Terminator: ");
-    Serial.println(maxUserBytes);
     return false;
   }
-
   if (!eraseTagUserMemory()) {
     return false;
   }
 
   size_t srcIndex = 0;
   for (uint8_t page = NTAG215_FIRST_USER_PAGE; page <= NTAG215_LAST_USER_PAGE; page++) {
-    uint8_t data[4] = { 0, 0, 0, 0 };
+    uint8_t data[4] = {0, 0, 0, 0};
     for (uint8_t i = 0; i < 4; i++) {
       if (srcIndex < text.length()) {
         data[i] = static_cast<uint8_t>(text[srcIndex++]);
@@ -367,24 +255,29 @@ bool writeStringToTag(const String& text) {
         srcIndex++;
       }
     }
-
-    if (!nfc.ntag2xx_WritePage(page, data)) {
-      Serial.print("Write failed at page ");
-      Serial.println(page);
+    if (!writePageWithRetry(page, data)) {
       return false;
     }
-
     if (srcIndex > text.length()) {
       break;
     }
   }
-
   return true;
 }
 
+void passwordToBytes(const String &password, uint8_t pwd[4]) {
+  pwd[0] = 0xFF;
+  pwd[1] = 0xFF;
+  pwd[2] = 0xFF;
+  pwd[3] = 0xFF;
+  for (size_t i = 0; i < 4 && i < password.length(); i++) {
+    pwd[i] = static_cast<uint8_t>(password[i]);
+  }
+}
+
 bool authenticateTag(const uint8_t pwd[4], uint8_t packOut[2]) {
-  uint8_t cmd[5] = { 0x1B, pwd[0], pwd[1], pwd[2], pwd[3] };  // PWD_AUTH
-  uint8_t resp[8] = { 0 };
+  uint8_t cmd[5] = {0x1B, pwd[0], pwd[1], pwd[2], pwd[3]};  // PWD_AUTH
+  uint8_t resp[8] = {0};
   uint8_t respLen = sizeof(resp);
   if (!nfc.inDataExchange(cmd, sizeof(cmd), resp, &respLen)) {
     return false;
@@ -397,107 +290,472 @@ bool authenticateTag(const uint8_t pwd[4], uint8_t packOut[2]) {
   return true;
 }
 
-bool setTagPassword(const uint8_t pwd[4], const uint8_t pack[2], uint8_t auth0) {
-  uint8_t cfg1[4] = { 0 };
-  uint8_t access[4] = { 0 };
-  uint8_t packPage[4] = { pack[0], pack[1], 0x00, 0x00 };
+bool setTagPassword(const uint8_t pwd[4], uint8_t auth0 = NTAG215_FIRST_USER_PAGE) {
+  uint8_t access[4] = {0};
+  uint8_t cfg1[4] = {0};
+  uint8_t packPage[4] = {pwd[0], pwd[1], 0x00, 0x00};  // PACK = first 2 pwd bytes
 
-  if (!nfc.ntag2xx_WritePage(NTAG215_PWD_PAGE, const_cast<uint8_t*>(pwd))) {
-    Serial.println("Write PWD failed.");
+  if (!writePageWithRetry(NTAG215_PWD_PAGE, const_cast<uint8_t *>(pwd))) {
     return false;
   }
-  if (!nfc.ntag2xx_WritePage(NTAG215_PACK_PAGE, packPage)) {
-    Serial.println("Write PACK failed.");
+  if (!writePageWithRetry(NTAG215_PACK_PAGE, packPage)) {
+    return false;
+  }
+  if (!readPageWithRetry(NTAG215_ACCESS_PAGE, access)) {
+    return false;
+  }
+  access[0] |= 0x80;  // PROT = 1 (read + write protection)
+  if (!writePageWithRetry(NTAG215_ACCESS_PAGE, access)) {
+    return false;
+  }
+  if (!readPageWithRetry(NTAG215_CFG1_PAGE, cfg1)) {
+    return false;
+  }
+  cfg1[3] = auth0;  // Protection starts at user page
+  if (!writePageWithRetry(NTAG215_CFG1_PAGE, cfg1)) {
+    return false;
+  }
+  return true;
+}
+
+bool removeTagPassword(const uint8_t oldPwd[4]) {
+  uint8_t packOut[2] = {0};
+  if (!authenticateTag(oldPwd, packOut)) {
     return false;
   }
 
-  if (!nfc.ntag2xx_ReadPage(NTAG215_ACCESS_PAGE, access)) {
-    Serial.println("Read ACCESS page failed.");
+  uint8_t cfg1[4] = {0};
+  uint8_t access[4] = {0};
+  uint8_t defaultPwd[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+  uint8_t defaultPack[4] = {0x00, 0x00, 0x00, 0x00};
+
+  if (!readPageWithRetry(NTAG215_CFG1_PAGE, cfg1)) {
     return false;
   }
-  access[0] |= 0x80;  // PROT=1 (read+write protection from AUTH0)
-  if (!nfc.ntag2xx_WritePage(NTAG215_ACCESS_PAGE, access)) {
-    Serial.println("Write ACCESS page failed.");
+  cfg1[3] = 0xFF;  // Disable protection
+  if (!writePageWithRetry(NTAG215_CFG1_PAGE, cfg1)) {
     return false;
   }
 
-  if (!nfc.ntag2xx_ReadPage(NTAG215_CFG1_PAGE, cfg1)) {
-    Serial.println("Read CFG1 page failed.");
+  if (!readPageWithRetry(NTAG215_ACCESS_PAGE, access)) {
     return false;
   }
-  cfg1[3] = auth0;
-  if (!nfc.ntag2xx_WritePage(NTAG215_CFG1_PAGE, cfg1)) {
-    Serial.println("Write CFG1 page failed.");
+  access[0] &= 0x7F;  // PROT = 0
+  if (!writePageWithRetry(NTAG215_ACCESS_PAGE, access)) {
+    return false;
+  }
+
+  if (!writePageWithRetry(NTAG215_PWD_PAGE, defaultPwd)) {
+    return false;
+  }
+  if (!writePageWithRetry(NTAG215_PACK_PAGE, defaultPack)) {
     return false;
   }
 
   return true;
 }
 
-bool removeTagPassword() {
-  uint8_t packOut[2] = { 0 };
-  if (!authenticateTag(currentPassword, packOut)) {
-    Serial.println("PWD_AUTH failed (falsches oder unbekanntes Passwort?).");
-  } else {
-    Serial.print("PWD_AUTH ok, PACK=");
-    nfc.PrintHex(packOut, 2);
+String bodyToString(uint8_t *data, size_t len) {
+  String out;
+  out.reserve(len);
+  for (size_t i = 0; i < len; i++) {
+    out += static_cast<char>(data[i]);
   }
-
-  uint8_t cfg1[4] = { 0 };
-  if (!nfc.ntag2xx_ReadPage(NTAG215_CFG1_PAGE, cfg1)) {
-    Serial.println("Read CFG1 page failed.");
-    return false;
-  }
-  cfg1[3] = 0xFF;  // Disable password protection
-  if (!nfc.ntag2xx_WritePage(NTAG215_CFG1_PAGE, cfg1)) {
-    Serial.println("Write CFG1 page failed.");
-    return false;
-  }
-
-  uint8_t access[4] = { 0 };
-  if (!nfc.ntag2xx_ReadPage(NTAG215_ACCESS_PAGE, access)) {
-    Serial.println("Read ACCESS page failed.");
-    return false;
-  }
-  access[0] &= 0x7F;  // PROT=0
-  if (!nfc.ntag2xx_WritePage(NTAG215_ACCESS_PAGE, access)) {
-    Serial.println("Write ACCESS page failed.");
-    return false;
-  }
-
-  uint8_t defaultPwd[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
-  uint8_t defaultPack[4] = { 0x00, 0x00, 0x00, 0x00 };
-  if (!nfc.ntag2xx_WritePage(NTAG215_PWD_PAGE, defaultPwd)) {
-    Serial.println("Reset PWD failed.");
-    return false;
-  }
-  if (!nfc.ntag2xx_WritePage(NTAG215_PACK_PAGE, defaultPack)) {
-    Serial.println("Reset PACK failed.");
-    return false;
-  }
-
-  memcpy(currentPassword, defaultPwd, sizeof(currentPassword));
-  return true;
+  return out;
 }
 
-int hexValue(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
-  if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
-  return -1;
+String getBodyField(const String &body, const char *key) {
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    return "";
+  }
+  if (!doc[key].is<const char *>()) {
+    return "";
+  }
+  return String(doc[key].as<const char *>());
 }
 
-bool parseHexBytes(const String& hex, uint8_t* out, size_t outLen) {
-  if (hex.length() != outLen * 2) {
-    return false;
-  }
-  for (size_t i = 0; i < outLen; i++) {
-    int hi = hexValue(hex[i * 2]);
-    int lo = hexValue(hex[i * 2 + 1]);
-    if (hi < 0 || lo < 0) {
-      return false;
+void sendJson(AsyncWebServerRequest *request, int statusCode, const JsonDocument &doc) {
+  String out;
+  serializeJson(doc, out);
+  request->send(statusCode, "application/json", out);
+}
+
+
+
+void setupEAPWiFi() {
+	WiFi.mode(WIFI_STA);
+	#if ESP_IDF_VERSION_MAJOR >= 5
+		esp_eap_client_clear_ca_cert();
+		esp_eap_client_clear_certificate_and_key();
+
+		// esp_eap_client_set_ttls_phase2_method(ESP_EAP_TTLS_PHASE2_EAP);
+		esp_eap_client_set_ttls_phase2_method(ESP_EAP_TTLS_PHASE2_MSCHAPV2);
+		// esp_eap_client_set_identity((const unsigned char *)WIFI_USER, strlen(WIFI_USER));
+		esp_eap_client_clear_identity();
+		esp_eap_client_set_username((const unsigned char *)WIFI_USER, strlen(WIFI_USER));
+		esp_eap_client_set_password((const unsigned char *)WIFI_PASSWORD, strlen(WIFI_PASSWORD));
+		esp_eap_client_set_disable_time_check(true);
+		esp_wifi_sta_enterprise_enable();
+	#else
+		//setzen von username und password
+		esp_wifi_sta_wpa2_ent_set_username((uint8_t *) WIFI_USER,
+				strlen(WIFI_USER)); //provide username
+		esp_wifi_sta_wpa2_ent_set_password((uint8_t *) WIFI_PASSWORD,
+				strlen(WIFI_PASSWORD)); //provide password
+		esp_wifi_sta_wpa2_ent_enable();
+	#endif
+	//starten der Netzwerkverbindung
+	WiFi.begin(WIFI_SSID);
+	WiFi.setHostname("myESPdevice"); //set Hostname for your device
+	while (WiFi.waitForConnectResult() != WL_CONNECTED) {
+		Serial.println("Connection Failed! Rebooting...");
+		delay(5000);
+		ESP.restart();
+	}
+	Serial.println("");
+	Serial.println("WiFi connected");
+	Serial.println("IP address set: ");
+	Serial.println(WiFi.localIP()); //print LAN IP	
+}
+
+
+void setupApiRoutes() {
+  server.on("/api/health", HTTP_GET, [](AsyncWebServerRequest *request) {
+    uint32_t reqId = ++apiRequestCounter;
+    logRequest(reqId, "GET /api/health from " + request->client()->remoteIP().toString());
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["service"] = "nfc-api";
+    doc["ip"] = currentIp();
+    sendJson(request, 200, doc);
+    logRequest(reqId, "GET /api/health -> 200");
+  });
+
+  auto readHandler = [](AsyncWebServerRequest *request) {
+    uint32_t reqId = ++apiRequestCounter;
+    String method = request->method() == HTTP_GET ? "GET" : "POST";
+    logRequest(reqId, method + " /api/tag/read from " + request->client()->remoteIP().toString());
+    setStatusLed(LED_BUSY);
+    uint8_t uid[7] = {0};
+    uint8_t uidLength = 0;
+    String text;
+
+    if (!readTagUid(uid, &uidLength)) {
+      setStatusLed(LED_ERROR);
+      request->send(404, "application/json", jsonError("Kein Tag erkannt."));
+      logRequest(reqId, "/api/tag/read -> 404 no tag");
+      return;
     }
-    out[i] = static_cast<uint8_t>((hi << 4) | lo);
+    if (!readTagText(text)) {
+      setStatusLed(LED_ERROR);
+      request->send(500, "application/json", jsonError("Tag erkannt, Text konnte nicht gelesen werden."));
+      logRequest(reqId, "/api/tag/read -> 500 text read failed");
+      return;
+    }
+
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["tagType"] = detectTagType(uidLength);
+    doc["uid"] = uidToHex(uid, uidLength);
+    doc["text"] = text;
+    setStatusLed(LED_OK);
+    sendJson(request, 200, doc);
+    logRequest(reqId, "/api/tag/read -> 200 uid=" + String(doc["uid"].as<const char*>()) + " textLen=" + String(text.length()));
+  };
+  server.on("/api/tag/read", HTTP_GET, readHandler);
+  server.on("/api/tag/read", HTTP_POST, readHandler);
+
+  server.on(
+      "/api/tag/write",
+      HTTP_POST,
+      [](AsyncWebServerRequest *request) {},
+      nullptr,
+      [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+        if (index != 0 || len != total) {
+          return;
+        }
+        uint32_t reqId = ++apiRequestCounter;
+        logRequest(reqId, "POST /api/tag/write from " + request->client()->remoteIP().toString());
+        setStatusLed(LED_BUSY);
+        String body = bodyToString(data, len);
+        String text = getBodyField(body, "text");
+        if (text.length() == 0 && request->hasParam("text", true)) {
+          text = request->getParam("text", true)->value();
+        }
+        if (text.length() == 0) {
+          setStatusLed(LED_ERROR);
+          request->send(400, "application/json", jsonError("Feld 'text' fehlt."));
+          logRequest(reqId, "/api/tag/write -> 400 missing text");
+          return;
+        }
+
+        uint8_t uid[7] = {0};
+        uint8_t uidLength = 0;
+        if (!readTagUid(uid, &uidLength)) {
+          setStatusLed(LED_ERROR);
+          request->send(404, "application/json", jsonError("Kein Tag erkannt."));
+          logRequest(reqId, "/api/tag/write -> 404 no tag");
+          return;
+        }
+        if (!writeStringToTag(text)) {
+          setStatusLed(LED_ERROR);
+          request->send(500, "application/json", jsonError("Schreiben fehlgeschlagen."));
+          logRequest(reqId, "/api/tag/write -> 500 write failed");
+          return;
+        }
+
+        JsonDocument doc;
+        doc["ok"] = true;
+        doc["uid"] = uidToHex(uid, uidLength);
+        doc["writtenText"] = text;
+        setStatusLed(LED_OK);
+        sendJson(request, 200, doc);
+        logRequest(reqId, "/api/tag/write -> 200 uid=" + String(doc["uid"].as<const char*>()) + " textLen=" + String(text.length()));
+      });
+
+  server.on(
+      "/api/tag/password/set",
+      HTTP_POST,
+      [](AsyncWebServerRequest *request) {},
+      nullptr,
+      [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+        if (index != 0 || len != total) {
+          return;
+        }
+        uint32_t reqId = ++apiRequestCounter;
+        logRequest(reqId, "POST /api/tag/password/set from " + request->client()->remoteIP().toString());
+        setStatusLed(LED_BUSY);
+        String body = bodyToString(data, len);
+        String password = getBodyField(body, "password");
+        if (password.length() == 0 && request->hasParam("password", true)) {
+          password = request->getParam("password", true)->value();
+        }
+        if (password.length() == 0) {
+          setStatusLed(LED_ERROR);
+          request->send(400, "application/json", jsonError("Feld 'password' fehlt."));
+          logRequest(reqId, "/api/tag/password/set -> 400 missing password");
+          return;
+        }
+
+        uint8_t uid[7] = {0};
+        uint8_t uidLength = 0;
+        if (!readTagUid(uid, &uidLength)) {
+          setStatusLed(LED_ERROR);
+          request->send(404, "application/json", jsonError("Kein Tag erkannt."));
+          logRequest(reqId, "/api/tag/password/set -> 404 no tag");
+          return;
+        }
+
+        uint8_t pwd[4];
+        passwordToBytes(password, pwd);
+        if (!setTagPassword(pwd, NTAG215_FIRST_USER_PAGE)) {
+          setStatusLed(LED_ERROR);
+          request->send(500, "application/json", jsonError("Passwort konnte nicht gesetzt werden."));
+          logRequest(reqId, "/api/tag/password/set -> 500 set failed");
+          return;
+        }
+
+        JsonDocument doc;
+        doc["ok"] = true;
+        doc["uid"] = uidToHex(uid, uidLength);
+        doc["message"] = "Passwort gesetzt.";
+        setStatusLed(LED_OK);
+        sendJson(request, 200, doc);
+        logRequest(reqId, "/api/tag/password/set -> 200");
+      });
+
+  server.on(
+      "/api/tag/password/remove",
+      HTTP_POST,
+      [](AsyncWebServerRequest *request) {},
+      nullptr,
+      [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+        if (index != 0 || len != total) {
+          return;
+        }
+        uint32_t reqId = ++apiRequestCounter;
+        logRequest(reqId, "POST /api/tag/password/remove from " + request->client()->remoteIP().toString());
+        setStatusLed(LED_BUSY);
+        String body = bodyToString(data, len);
+        String oldPassword = getBodyField(body, "oldPassword");
+        if (oldPassword.length() == 0 && request->hasParam("oldPassword", true)) {
+          oldPassword = request->getParam("oldPassword", true)->value();
+        }
+        if (oldPassword.length() == 0) {
+          setStatusLed(LED_ERROR);
+          request->send(400, "application/json", jsonError("Feld 'oldPassword' fehlt."));
+          logRequest(reqId, "/api/tag/password/remove -> 400 missing oldPassword");
+          return;
+        }
+
+        uint8_t uid[7] = {0};
+        uint8_t uidLength = 0;
+        if (!readTagUid(uid, &uidLength)) {
+          setStatusLed(LED_ERROR);
+          request->send(404, "application/json", jsonError("Kein Tag erkannt."));
+          logRequest(reqId, "/api/tag/password/remove -> 404 no tag");
+          return;
+        }
+
+        uint8_t oldPwd[4];
+        passwordToBytes(oldPassword, oldPwd);
+        if (!removeTagPassword(oldPwd)) {
+          setStatusLed(LED_ERROR);
+          request->send(401, "application/json", jsonError("Altes Passwort falsch oder Tag konnte nicht entsperrt werden."));
+          logRequest(reqId, "/api/tag/password/remove -> 401 auth failed");
+          return;
+        }
+
+        JsonDocument doc;
+        doc["ok"] = true;
+        doc["uid"] = uidToHex(uid, uidLength);
+        doc["message"] = "Passwort entfernt.";
+        setStatusLed(LED_OK);
+        sendJson(request, 200, doc);
+        logRequest(reqId, "/api/tag/password/remove -> 200");
+      });
+
+  server.on("/api/tag/erase", HTTP_POST, [](AsyncWebServerRequest *request) {
+    uint32_t reqId = ++apiRequestCounter;
+    logRequest(reqId, "POST /api/tag/erase from " + request->client()->remoteIP().toString());
+    setStatusLed(LED_BUSY);
+    uint8_t uid[7] = {0};
+    uint8_t uidLength = 0;
+
+    if (!readTagUid(uid, &uidLength)) {
+      setStatusLed(LED_ERROR);
+      request->send(404, "application/json", jsonError("Kein Tag erkannt."));
+      logRequest(reqId, "/api/tag/erase -> 404 no tag");
+      return;
+    }
+    if (!eraseTagUserMemory()) {
+      setStatusLed(LED_ERROR);
+      request->send(500, "application/json", jsonError("Tag konnte nicht geloescht werden."));
+      logRequest(reqId, "/api/tag/erase -> 500 erase failed");
+      return;
+    }
+
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["uid"] = uidToHex(uid, uidLength);
+    doc["message"] = "Tag geloescht.";
+    setStatusLed(LED_OK);
+    sendJson(request, 200, doc);
+    logRequest(reqId, "/api/tag/erase -> 200");
+  });
+
+}
+
+bool setupFileSystem() {
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS mount failed");
+    setStatusLed(LED_ERROR);
+    return false;
   }
   return true;
+}
+
+void setupWebRoutes() {
+  // React app deployment target: LittleFS:/webapp
+  server.serveStatic("/", LittleFS, "/webapp/").setDefaultFile("index.html");
+
+  server.onNotFound([](AsyncWebServerRequest *request) {
+    String url = request->url();
+    if (url.startsWith("/api/")) {
+      request->send(404, "application/json", jsonError("Route nicht gefunden."));
+      return;
+    }
+    request->send(LittleFS, "/webapp/index.html", "text/html");
+  });
+}
+
+void setupNfc() {
+  logLine("NFC init start: IRQ=" + String(PN532_IRQ_PIN) + " RESET=" + String(PN532_RESET_PIN) +
+          " SDA=" + String(I2C_SDA_PIN) + " SCL=" + String(I2C_SCL_PIN));
+  pinMode(PN532_IRQ_PIN, INPUT_PULLUP);
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+  if (!nfc.begin()) {
+    Serial.println("nfc.begin() failed");
+    setStatusLed(LED_ERROR);
+    while (1) {
+      delay(1000);
+    }
+  }
+
+  uint32_t version = nfc.getFirmwareVersion();
+  if (!version) {
+    Serial.println("PN532 not found");
+    setStatusLed(LED_ERROR);
+    while (1) {
+      delay(1000);
+    }
+  }
+
+  if (!nfc.SAMConfig()) {
+    Serial.println("SAMConfig failed");
+    setStatusLed(LED_ERROR);
+    while (1) {
+      delay(1000);
+    }
+  }
+
+  Serial.print("PN532 ready, firmware: ");
+  Serial.print((version >> 16) & 0xFF, DEC);
+  Serial.print(".");
+  Serial.println((version >> 8) & 0xFF, DEC);
+}
+
+void setupWiFi() {
+  WiFi.mode(WIFI_AP);
+  bool ok = WiFi.softAP(AP_SSID, AP_PASSWORD);
+  if (!ok) {
+    Serial.println("SoftAP start failed");
+    setStatusLed(LED_ERROR);
+    while (1) {
+      delay(1000);
+    }
+  }
+  Serial.print("AP SSID: ");
+  Serial.println(AP_SSID);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("NFC REST API booting...");
+  logLine("Debug logging enabled");
+  statusLed.begin();
+  statusLed.setBrightness(40);
+  setStatusLed(LED_BOOT);
+
+  //setupWiFi();
+  setupEAPWiFi();
+
+  setStatusLed(LED_WIFI_READY);
+  if (!setupFileSystem()) {
+    while (1) {
+      delay(1000);
+    }
+  }
+  setupNfc();
+  setupApiRoutes();
+  setupWebRoutes();
+  server.begin();
+  setStatusLed(LED_IDLE);
+
+  Serial.println("REST API ready.");
+  Serial.println("GET|POST /api/tag/read");
+  Serial.println("POST /api/tag/write      body: {\"text\":\"Hallo\"}");
+  Serial.println("POST /api/tag/password/set    body: {\"password\":\"abcd\"}");
+  Serial.println("POST /api/tag/password/remove body: {\"oldPassword\":\"abcd\"}");
+  Serial.println("POST /api/tag/erase");
+}
+
+void loop() {
+  delay(10);
 }

@@ -1,0 +1,89 @@
+.app {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 24px 16px 48px;
+  display: grid;
+  gap: 16px;
+}
+
+.panel {
+  background: #ffffff;
+  border: 1px solid #d9e0e8;
+  border-radius: 12px;
+  padding: 16px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+}
+
+h1,
+h2 {
+  margin: 0 0 10px 0;
+}
+
+.hint {
+  margin: 0 0 12px 0;
+  color: #5a6573;
+}
+
+.actions {
+  margin-top: 12px;
+}
+
+button {
+  border: 0;
+  border-radius: 10px;
+  padding: 10px 14px;
+  background: #0f766e;
+  color: #fff;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+textarea {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid #c9d1dc;
+  border-radius: 10px;
+  padding: 10px;
+  font: inherit;
+}
+
+.result {
+  margin-top: 14px;
+  padding: 12px;
+  border-radius: 10px;
+  background: #f3f7fb;
+  border: 1px solid #d9e5f3;
+  display: grid;
+  gap: 6px;
+}
+
+.status {
+  border-radius: 10px;
+  padding: 12px 14px;
+  font-weight: 600;
+}
+
+.status.idle {
+  background: #eef2f6;
+  color: #364152;
+}
+
+.status.info {
+  background: #e0f2fe;
+  color: #0c4a6e;
+}
+
+.status.success {
+  background: #dcfce7;
+  color: #14532d;
+}
+
+.status.error {
+  background: #fee2e2;
+  color: #7f1d1d;
+}
