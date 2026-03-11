@@ -18,10 +18,10 @@
 
 
 // PN532 over I2C with IRQ/RESET lines
-constexpr uint8_t PN532_IRQ_PIN = 2;
-constexpr uint8_t PN532_RESET_PIN = 3;
-constexpr uint8_t I2C_SDA_PIN = 8;
-constexpr uint8_t I2C_SCL_PIN = 9;
+constexpr uint8_t PN532_IRQ_PIN = -1;    // Not used in this wiring, but required by library constructor
+constexpr uint8_t PN532_RESET_PIN = -1;  // Not used in this wiring, but required by library constructor
+constexpr uint8_t I2C_SDA_PIN = 16;
+constexpr uint8_t I2C_SCL_PIN = 17;
 constexpr uint8_t STATUS_LED_PIN = 48;
 constexpr uint8_t STATUS_LED_COUNT = 1;
 
@@ -382,9 +382,16 @@ void sendJson(AsyncWebServerRequest *request, int statusCode, const JsonDocument
   request->send(statusCode, "application/json", out);
 }
 
+bool hasConfiguredEnterpriseWiFi() {
+  return strlen(WIFI_SSID) > 0 &&
+         strlen(WIFI_USER) > 0 &&
+         strlen(WIFI_PASSWORD) > 0 &&
+         strcmp(WIFI_USER, "Tim.Pusterhofer") != 0 &&
+         strcmp(WIFI_PASSWORD, "Rainbow_Dash") != 0;
+}
 
 
-void setupEAPWiFi() {
+bool setupEAPWiFi(uint32_t connectTimeoutMs = 20000) {
 	WiFi.mode(WIFI_STA);
 	#if ESP_IDF_VERSION_MAJOR >= 5
 		esp_eap_client_clear_ca_cert();
@@ -409,15 +416,25 @@ void setupEAPWiFi() {
 	//starten der Netzwerkverbindung
 	WiFi.begin(WIFI_SSID);
 	WiFi.setHostname("myESPdevice"); //set Hostname for your device
-	while (WiFi.waitForConnectResult() != WL_CONNECTED) {
-		Serial.println("Connection Failed! Rebooting...");
-		delay(5000);
-		ESP.restart();
-	}
+  const uint32_t startedAt = millis();
+  while (millis() - startedAt < connectTimeoutMs) {
+    uint8_t status = WiFi.waitForConnectResult();
+    if (status == WL_CONNECTED) {
+      Serial.println("");
+      Serial.println("WiFi connected");
+      Serial.println("IP address set: ");
+      Serial.println(WiFi.localIP()); //print LAN IP
+      return true;
+    }
+    Serial.println("Connection Failed, retrying...");
+    WiFi.disconnect(true, true);
+    delay(1000);
+    WiFi.begin(WIFI_SSID);
+  }
 	Serial.println("");
-	Serial.println("WiFi connected");
-	Serial.println("IP address set: ");
-	Serial.println(WiFi.localIP()); //print LAN IP	
+  Serial.println("Enterprise WiFi connection timed out");
+  WiFi.disconnect(true, true);
+  return false;
 }
 
 
@@ -708,20 +725,38 @@ void setupNfc() {
   Serial.println((version >> 8) & 0xFF, DEC);
 }
 
-void setupWiFi() {
+bool setupWiFi() {
   WiFi.mode(WIFI_AP);
   bool ok = WiFi.softAP(AP_SSID, AP_PASSWORD);
   if (!ok) {
     Serial.println("SoftAP start failed");
-    setStatusLed(LED_ERROR);
-    while (1) {
-      delay(1000);
-    }
+    return false;
   }
   Serial.print("AP SSID: ");
   Serial.println(AP_SSID);
   Serial.print("AP IP: ");
   Serial.println(WiFi.softAPIP());
+  return true;
+}
+
+void setupNetwork() {
+  if (hasConfiguredEnterpriseWiFi()) {
+    logLine("Trying enterprise WiFi connection");
+    if (setupEAPWiFi()) {
+      return;
+    }
+    logLine("Enterprise WiFi unavailable, falling back to ESP32 access point");
+  } else {
+    logLine("Enterprise WiFi not configured, starting ESP32 access point");
+  }
+
+  if (!setupWiFi()) {
+    Serial.println("Network startup failed");
+    setStatusLed(LED_ERROR);
+    while (1) {
+      delay(1000);
+    }
+  }
 }
 
 void setup() {
@@ -733,8 +768,7 @@ void setup() {
   statusLed.setBrightness(40);
   setStatusLed(LED_BOOT);
 
-  //setupWiFi();
-  setupEAPWiFi();
+  setupNetwork();
 
   setStatusLed(LED_WIFI_READY);
   if (!setupFileSystem()) {
