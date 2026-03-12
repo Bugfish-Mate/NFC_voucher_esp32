@@ -24,11 +24,14 @@ async function apiRequest(path, options = {}) {
 
 function App() {
   const [readResult, setReadResult] = useState(null)
-  const [writeText, setWriteText] = useState('')
+  const [selectedClass, setSelectedClass] = useState('')
+  const [reason, setReason] = useState('')
   const [status, setStatus] = useState({ type: 'idle', message: 'Bereit.' })
   const [busy, setBusy] = useState(false)
 
-  const canWrite = useMemo(() => writeText.trim().length > 0 && !busy, [writeText, busy])
+  const classes = ['1A', '1B', '2A', '2B', '3A', '3B', '4A', '4B', '5A', '5B']
+
+  const canWrite = useMemo(() => selectedClass && reason.trim().length > 0 && !busy, [selectedClass, reason, busy])
 
   const readTag = async () => {
     setBusy(true)
@@ -50,9 +53,9 @@ function App() {
     try {
       await apiRequest('/api/tag/write', {
         method: 'POST',
-        body: JSON.stringify({ text: writeText }),
+        body: JSON.stringify({ class: selectedClass, reason: reason }),
       })
-      setStatus({ type: 'success', message: 'Text wurde auf Tag geschrieben.' })
+      setStatus({ type: 'success', message: 'Daten wurden auf Tag geschrieben.' })
     } catch (error) {
       setStatus({ type: 'error', message: error.message })
     } finally {
@@ -83,13 +86,25 @@ function App() {
 
       <section className="panel">
         <h2>NFC beschreiben</h2>
-        <label htmlFor="writeText">Text</label>
+        <label htmlFor="classSelect">Klasse auswählen</label>
+        <select
+          id="classSelect"
+          value={selectedClass}
+          onChange={(e) => setSelectedClass(e.target.value)}
+          disabled={busy}
+        >
+          <option value="">-- Klasse wählen --</option>
+          {classes.map(cls => (
+            <option key={cls} value={cls}>{cls}</option>
+          ))}
+        </select>
+        <label htmlFor="reason">Grund für den freien Tag</label>
         <textarea
-          id="writeText"
-          value={writeText}
-          onChange={(e) => setWriteText(e.target.value)}
-          placeholder="Text für den NFC-Tag..."
-          rows={5}
+          id="reason"
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          placeholder="Grund eingeben..."
+          rows={3}
           disabled={busy}
         />
         <div className="actions">
