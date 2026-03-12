@@ -20,8 +20,8 @@
 // PN532 over I2C with IRQ/RESET lines
 constexpr uint8_t PN532_IRQ_PIN = 2;
 constexpr uint8_t PN532_RESET_PIN = 3;
-constexpr uint8_t I2C_SDA_PIN = 8;
-constexpr uint8_t I2C_SCL_PIN = 9;
+constexpr uint8_t I2C_SDA_PIN = 16;
+constexpr uint8_t I2C_SCL_PIN = 17;
 constexpr uint8_t STATUS_LED_PIN = 48;
 constexpr uint8_t STATUS_LED_COUNT = 1;
 
